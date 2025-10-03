@@ -1,6 +1,3 @@
-# main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 import threading
 import cv2
 import numpy as np
@@ -9,16 +6,6 @@ from datetime import datetime, time
 import mysql.connector
 import os
 import time as t
-
-app = FastAPI()
-
-# Allow React frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Replace with frontend URL in production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ------------------ Attendance System ------------------
 images_dir = "C:/Users/Aniruddha/OneDrive/Pictures/Camera Roll/"
