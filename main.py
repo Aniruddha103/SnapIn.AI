@@ -4,21 +4,9 @@ import numpy as np
 import face_recognition
 from datetime import datetime, time, timedelta
 import mysql.connector
-import os
 import time as t
 
 # ------------------ Attendance System ------------------
-images_dir = "C:/Users/Aniruddha/OneDrive/Pictures/Camera Roll/"
-
-images_path = {}
-student_ids = {}
-
-for filename in os.listdir(images_dir):
-    if filename.lower().endswith((".jpg", ".jpeg", ".png")):
-        roll_no = os.path.splitext(filename)[0]
-        images_path[roll_no] = os.path.join(images_dir, filename)
-        student_ids[roll_no] = int(roll_no)
-
 marked_students = set()
 running = False 
 
@@ -28,7 +16,7 @@ def create_connection():
         connection = mysql.connector.connect(
             host="localhost",
             user="root",
-            password="",
+            password="",    
             database="student"
         )
         if connection.is_connected():
@@ -38,39 +26,49 @@ def create_connection():
         print(f"Error: {e}")
         return None
 
-def insert_student(student_id, roll_no):
+def insert_student(student_id, roll_no, class_name):
     connection = create_connection()
     if connection:
         try:
             cursor = connection.cursor()
             now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            query = "INSERT INTO students (id, name, timestamp) VALUES (%s, %s, %s)"
-            cursor.execute(query, (student_id, roll_no, now))
+            query = "INSERT INTO students (id, name, class_name, timestamp) VALUES (%s, %s, %s, %s)"
+            cursor.execute(query, (student_id, roll_no, class_name, now))
             connection.commit()
-            print(f"Inserted {roll_no} (ID: {student_id}) at {now}")
+            print(f"Inserted {roll_no} (ID: {student_id}) at {now} for {class_name}")
         except mysql.connector.Error as e:
             print(f"Error: {e}")
         finally:
             cursor.close()
             connection.close()
 
-def mark_attendance(roll_no):
-    if roll_no in student_ids and roll_no not in marked_students:
-        student_id = student_ids[roll_no]
-        insert_student(student_id, roll_no)
+def mark_attendance(roll_no, class_name):
+    if roll_no not in marked_students:
+        insert_student(roll_no, roll_no, class_name)
         marked_students.add(roll_no)
 
-def load_known_faces_and_names():
+# ------------------ Fetch Known Faces from DB ------------------
+def load_known_faces_from_db():
+    connection = create_connection()
     known_face_encodings = []
     known_face_names = []
-    for roll_no, path in images_path.items():
-        if not os.path.exists(path):
-            continue
-        image = face_recognition.load_image_file(path)
-        encodings = face_recognition.face_encodings(image)
-        if encodings:
-            known_face_encodings.append(encodings[0])
-            known_face_names.append(roll_no)
+    if not connection:
+        return known_face_encodings, known_face_names
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT student_id, name, image FROM student_images")
+        rows = cursor.fetchall()
+        for row in rows:
+            nparr = np.frombuffer(row["image"], np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            encodings = face_recognition.face_encodings(img)
+            if encodings:
+                known_face_encodings.append(encodings[0])
+                known_face_names.append(str(row["student_id"]))
+    finally:
+        cursor.close()
+        connection.close()
     return known_face_encodings, known_face_names
 
 # ------------------ Fetch Timetable from DB ------------------
@@ -82,36 +80,31 @@ def fetch_timetable_from_db():
     timetable = []
     try:
         cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT class_name, start_time, end_time FROM timetable")
+        cursor.execute("SELECT class_name, start_time, end_time, camera_url FROM timetable")
         rows = cursor.fetchall()
         for row in rows:
             timetable.append({
                 "class_name": row["class_name"],
                 "start": row["start_time"],
-                "end": row["end_time"]
+                "end": row["end_time"],
+                "camera_url": row["camera_url"]
             })
-    except mysql.connector.Error as e:
-        print(f"Error fetching timetable: {e}")
     finally:
         cursor.close()
         connection.close()
-    
     return timetable
 
 # Load timetable once at start
 timetable = fetch_timetable_from_db()
 
 # ------------------ Camera Thread ------------------
-def run_camera():
+def run_camera(camera_url, class_name):
     global running
-    known_face_encodings, known_face_names = load_known_faces_and_names()
-    video_capture = cv2.VideoCapture(0)
-
-    # For CCTV cameras example: 
-    #video_capture = cv2.VideoCapture("rtsp://username:password@camera_ip:554/stream1")
+    known_face_encodings, known_face_names = load_known_faces_from_db()
+    video_capture = cv2.VideoCapture(camera_url)
 
     if not video_capture.isOpened():
-        print("Cannot access camera")
+        print(f"Cannot access camera for {class_name}")
         running = False
         return
 
@@ -130,12 +123,12 @@ def run_camera():
             best_match_index = np.argmin(face_distances)
             if matches[best_match_index]:
                 roll_no = known_face_names[best_match_index]
-                mark_attendance(roll_no)
+                mark_attendance(roll_no, class_name)
                 top, right, bottom, left = [v*2 for v in face_location]
                 cv2.rectangle(frame, (left, top), (right, bottom), (0,255,0), 2)
                 cv2.putText(frame, roll_no, (left, top-10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
-        cv2.imshow("Attendance", frame)
+        cv2.imshow(f"Attendance - {class_name}", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -150,22 +143,18 @@ def attendance_scheduler():
 
     while True:
         now = datetime.now()
-        class_running = False
-
         for cls in timetable:
             class_start = datetime.combine(now.date(), cls["start"])
             class_end = datetime.combine(now.date(), cls["end"])
-
             if class_start <= now < class_end:
-                class_running = True
-
                 # Start camera only if within first 10 mins
                 if not running and now < class_start + attendance_duration:
                     running = True
-                    thread = threading.Thread(target=run_camera, daemon=True)
+                    camera_url = cls["camera_url"]
+                    thread = threading.Thread(target=run_camera, args=(camera_url, cls["class_name"]), daemon=True)
                     thread.start()
                     print(f"{cls['class_name']} started at {now.time()}, taking attendance for 10 mins...")
-                break  # Only one class at a time
+                break
 
         # Stop camera if running and either 10 mins passed or class ended
         if running:
@@ -175,3 +164,6 @@ def attendance_scheduler():
                 print(f"Attendance window ended at {now.time()}, camera stopped.")
 
         t.sleep(5)
+
+# ------------------ Start Scheduler ------------------
+attendance_scheduler()
